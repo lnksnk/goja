@@ -2701,30 +2701,141 @@ type iteratorRecord struct {
 	next     func(FunctionCall) Value
 }
 
+func getGoIterSeq1(obj Value) (nxt func() (reflect.Value, bool), stop func(), caniter bool) {
+	if itertpe := obj.ExportType(); itertpe.Kind() == reflect.Func {
+		if itertpe.CanSeq() && itertpe.NumIn() == 1 && itertpe.NumOut() == 0 {
+			nxt, stop = iter.Pull(reflect.ValueOf(obj.Export()).Seq())
+			return nxt, stop, nxt != nil && stop != nil
+		}
+		if itertpe.NumIn() == 0 && itertpe.NumOut() == 1 && itertpe.Out(0).CanSeq() {
+			if rslt := reflect.ValueOf(obj.Export()).Call(nil); len(rslt) > 0 {
+				nxt, stop = iter.Pull(rslt[0].Seq())
+				return nxt, stop, nxt != nil && stop != nil
+			}
+			return
+		}
+		return
+	}
+	return
+}
+
+func getGoIterSeq2(obj Value) (nxt func() (reflect.Value, reflect.Value, bool), stop func(), caniter bool) {
+	if itertpe := obj.ExportType(); itertpe.Kind() == reflect.Func {
+		if itertpe.CanSeq2() && itertpe.NumIn() == 1 && itertpe.NumOut() == 0 {
+			nxt, stop = iter.Pull2(reflect.ValueOf(obj.Export()).Seq2())
+			return nxt, stop, nxt != nil && stop != nil
+		}
+		if itertpe.NumIn() == 0 && itertpe.NumOut() == 1 && itertpe.Out(0).CanSeq2() {
+			if rslt := reflect.ValueOf(obj.Export()).Call(nil); len(rslt) > 0 {
+				nxt, stop = iter.Pull2(rslt[0].Seq2())
+				return nxt, stop, nxt != nil && stop != nil
+			}
+			return
+		}
+		return
+	}
+	return
+}
+
+func getGoIterSeq(obj Value) (nxtval func() (reflect.Value, bool), stop func(), caniter bool) {
+	if nxtval, stop, caniter = getGoIterSeq1(obj); caniter {
+		return
+	}
+	var nxt2 func() (reflect.Value, reflect.Value, bool)
+	if nxt2, stop, caniter = getGoIterSeq2(obj); caniter {
+		nxtval = func() (reflect.Value, bool) {
+			var rv1, rv2 reflect.Value
+			var nxt bool
+			if rv1, rv2, nxt = nxt2(); nxt {
+				return reflect.ValueOf([]any{rv1.Interface(), rv2.Interface()}), nxt
+			}
+			return reflect.ValueOf([]any{}), nxt
+		}
+	}
+	return
+}
+
 func (r *Runtime) getIterator(obj Value, method func(FunctionCall) Value) *iteratorRecord {
 	if method == nil {
-		method = toMethod(r.getV(obj, SymIterator))
-		if method == nil {
-			panic(r.NewTypeError("object is not iterable"))
+		if method = toMethod(r.getV(obj, SymIterator)); method != nil {
+			iter := r.toObject(method(FunctionCall{
+				This: obj,
+			}))
+
+			var next func(FunctionCall) Value
+
+			if obj, ok := iter.self.getStr("next", nil).(*Object); ok {
+				if call, ok := obj.self.assertCallable(); ok {
+					next = call
+				}
+			}
+
+			return &iteratorRecord{
+				iterator: iter,
+				next:     next,
+			}
+		}
+
+		if itrnxt, itrstp, found := getGoIterSeq(obj); found {
+			var outcme = map[string]any{}
+			nxtval := func() (val any, vld bool) {
+				if itrstp != nil {
+					val, vld = itrnxt()
+					if vld {
+						vld = !vld
+						val = val.(reflect.Value).Interface()
+						return
+					}
+					val = nil
+					vld = true
+					return
+				}
+				return nil, true
+			}
+
+			rtrn := func() {
+				if itrstp != nil {
+					itrstp()
+					itrstp = nil
+				}
+			}
+
+			outcme["next"] = func() any {
+				val, vld := nxtval()
+				outcme["value"] = val
+				outcme["done"] = vld
+				if vld {
+					rtrn()
+					return outcme
+				}
+				return outcme
+			}
+
+			outcme["return"] = func() any {
+				rtrn()
+				outcme["value"] = nil
+				outcme["done"] = true
+				return outcme
+			}
+
+			iter := r.toObject(r.ToValue(outcme))
+
+			var next func(FunctionCall) Value
+
+			obj, ok := iter.self.getStr("next", nil).(*Object)
+			if ok {
+				if call, ok := obj.self.assertCallable(); ok {
+					next = call
+				}
+			}
+
+			return &iteratorRecord{
+				iterator: iter,
+				next:     next,
+			}
 		}
 	}
-
-	iter := r.toObject(method(FunctionCall{
-		This: obj,
-	}))
-
-	var next func(FunctionCall) Value
-
-	if obj, ok := iter.self.getStr("next", nil).(*Object); ok {
-		if call, ok := obj.self.assertCallable(); ok {
-			next = call
-		}
-	}
-
-	return &iteratorRecord{
-		iterator: iter,
-		next:     next,
-	}
+	panic(r.NewTypeError("object is not iterable"))
 }
 
 func iteratorComplete(iterResult *Object) bool {
